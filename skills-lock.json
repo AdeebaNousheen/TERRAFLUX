@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "skills": {
+    "kie-chat-agents": {
+      "source": "kie.ai",
+      "sourceType": "well-known",
+      "computedHash": "806c6840866c2665edb2b54785406728185913db288e0b567ff9f586bff4c13c"
+    },
+    "kie-models": {
+      "source": "kie.ai",
+      "sourceType": "well-known",
+      "computedHash": "9a8ed0bc28ef13ce38f33572ff7930104c23d343f94e0867ae222ff238fa9533"
+    }
+  }
+}
