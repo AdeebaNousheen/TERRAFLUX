@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   Activity,
@@ -45,8 +45,8 @@ import {
 } from "react-leaflet";
 
 import "leaflet/dist/leaflet.css";
-import type { Role, Incident, EvacuationRecord, Notification, AuditLog, Shelter as ShelterModel, Donation, SOSAlert } from "./types";
-import { prototypeApi, predictFloodRisk } from "./services/prototypeApi";
+import type { Role, Incident, EvacuationRecord, Notification, AuditLog, Shelter as ShelterModel, Donation, SOSAlert, RiskPrediction } from "./types";
+import { prototypeApi, predictFloodRiskFallback, mapIncident, mapShelter, mapHousehold, mapSos, mapAudit } from "./services/prototypeApi";
 
 type Page =
   | "overview"
@@ -270,6 +270,8 @@ function RiskBadge({ risk }: { risk: number }) {
 function App() {
   const [activePage, setActivePage] = useState<Page>("overview");
   const [scenarioIndex, setScenarioIndex] = useState(0);
+  const [scenarioOverrides, setScenarioOverrides] = useState<Partial<Scenario>>({});
+  const [apiOnline, setApiOnline] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [sosSent, setSosSent] = useState(false);
   const [networkOnline, setNetworkOnline] = useState(true);
@@ -296,15 +298,89 @@ function App() {
   ]);
   const [audit, setAudit] = useState<AuditLog[]>([]);
   const [donations, setDonations] = useState<Donation[]>([]);
+  const [reliefRequirements, setReliefRequirements] = useState<Record<string, unknown>[]>([]);
+  const [communicationNodes, setCommunicationNodes] = useState<Record<string, unknown>[]>([]);
+  const [rescueAssignments, setRescueAssignments] = useState<Record<string, unknown>[]>([]);
+  const [dashboardSummary, setDashboardSummary] = useState<Record<string, unknown> | null>(null);
+  const [impactSummary, setImpactSummary] = useState<Record<string, unknown> | null>(null);
   const [routeText, setRouteText] = useState("River road to Community Hall A");
   const [sosForm, setSosForm] = useState({ people: 2, location: "Rampur Village", medical: false, condition: "Flood water rising", battery: 45 });
   const [layers, setLayers] = useState<Record<string, boolean>>({ risk: true, flood: true, villages: true, roads: true, bridges: true, shelters: true, sos: true, teams: true, nodes: true, evacuation: true });
   const [formMessage, setFormMessage] = useState("");
   const [riskInputs, setRiskInputs] = useState({ rainfall: 38, forecastRainfall: 54, soilMoisture: 56, elevation: 1180, slope: 32, waterLevel: 50, historicalFrequency: 70, iotObservations: 18, terrainVulnerability: 80 });
+  const [rulePrediction, setRulePrediction] = useState<RiskPrediction>(() => predictFloodRiskFallback(riskInputs));
   const logAction = (action: string, detail: string) => setAudit((rows) => [{ id: `A-${Date.now()}`, action, detail, time: new Date().toLocaleTimeString() }, ...rows]);
+  const updateHousehold = async (record: EvacuationRecord, nextStatus: EvacuationRecord["status"]) => {
+    setRecords((rows) => rows.map((row) => row.id === record.id ? { ...row, status: nextStatus } : row));
+    try { const saved = await prototypeApi.updateHousehold(record.id, nextStatus); setRecords((rows) => rows.map((row) => row.id === record.id ? mapHousehold(saved) : row)); setApiOnline(true); } catch { /* keep local demo update */ }
+    logAction("Evacuation status updated", `${record.id}: ${nextStatus}`);
+  };
+  const updateShelterOccupancy = async (shelter: ShelterModel) => {
+    const occupants = Math.min(shelter.capacity, shelter.occupants + 10);
+    setShelterRows((rows) => rows.map((row) => row.id === shelter.id ? { ...row, occupants } : row));
+    try { const saved = await prototypeApi.updateShelter(shelter.id, { occupants }); setShelterRows((rows) => rows.map((row) => row.id === shelter.id ? mapShelter(saved) : row)); setApiOnline(true); } catch { /* keep local demo update */ }
+    logAction("Shelter updated", `${shelter.name}; occupancy +10`);
+  };
+  const donateSimulated = async () => {
+    const fallbackId = `TXN-SIM-${Date.now().toString(36).toUpperCase()}`;
+    setDonations((rows) => [{ id: fallbackId, requirementId: "REQ-RAMPUR-WATER", amount: 500, transactionId: fallbackId, simulated: true }, ...rows]);
+    try {
+      const result = await prototypeApi.simulateDonation();
+      const donation = { id: String(result.id), requirementId: "REQ-RAMPUR-WATER", amount: Number(result.amount || 500), transactionId: String(result.id), simulated: true as const };
+      setDonations((rows) => [donation, ...rows.filter((row) => row.id !== fallbackId)]);
+      setFormMessage(`Simulated transaction ${donation.transactionId}`); setApiOnline(true);
+    } catch { setFormMessage(`Simulated transaction ${fallbackId} (local fallback)`); }
+    logAction("Simulated donation", "INR 500 prototype allocation");
+  };
 
-  const scenario = scenarios[scenarioIndex];
-  const rulePrediction = useMemo(() => predictFloodRisk({ ...riskInputs, iotObservations: networkOnline ? riskInputs.iotObservations : Math.min(riskInputs.iotObservations, 11) }), [riskInputs, networkOnline]);
+  const scenario = { ...scenarios[scenarioIndex], ...scenarioOverrides };
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      const results = await Promise.allSettled([
+        prototypeApi.getSimulation(), prototypeApi.getIncidents(), prototypeApi.getSos(),
+        prototypeApi.getShelters(), prototypeApi.getHouseholds(), prototypeApi.getAuditLogs(),
+        prototypeApi.getDonations(), prototypeApi.getCommunicationNodes(), prototypeApi.getRoutes(),
+        prototypeApi.getDashboardSummary(), prototypeApi.getImpact(), prototypeApi.getRequirements(), prototypeApi.getRescueAssignments(),
+      ]);
+      if (!active) return;
+      const [sim, incidents, sos, shelterData, households, auditData, donationData, nodes, routes, summary, impact, requirements, assignments] = results;
+      let connected = false;
+      if (sim.status === "fulfilled") {
+        connected = true;
+        const stage = Math.max(0, Math.min(scenarios.length - 1, Number(sim.value.stage || 0)));
+        setScenarioIndex(stage);
+        setScenarioOverrides({ rainfallValue: Number(sim.value.rainfall), soil: Number(sim.value.soil_moisture), water: `${sim.value.water_level} m`, roads: Number(sim.value.affected_roads) });
+      }
+      if (incidents.status === "fulfilled") { connected = true; setIncidentRows(incidents.value.map(mapIncident)); }
+      if (sos.status === "fulfilled") { connected = true; setSosAlerts(sos.value.map(mapSos)); }
+      if (shelterData.status === "fulfilled") { connected = true; setShelterRows(shelterData.value.map(mapShelter)); }
+      if (households.status === "fulfilled") { connected = true; setRecords(households.value.map(mapHousehold)); }
+      if (auditData.status === "fulfilled") { connected = true; setAudit(auditData.value.map(mapAudit)); }
+      if (nodes.status === "fulfilled") { connected = true; setCommunicationNodes(nodes.value); }
+      if (routes.status === "fulfilled") connected = true;
+      if (summary.status === "fulfilled") { connected = true; setDashboardSummary(summary.value); }
+      if (impact.status === "fulfilled") { connected = true; setImpactSummary(impact.value); }
+      if (requirements.status === "fulfilled") { connected = true; setReliefRequirements(requirements.value); }
+      if (assignments.status === "fulfilled") { connected = true; setRescueAssignments(assignments.value); }
+      if (donationData.status === "fulfilled") {
+        connected = true;
+        const transactions = Array.isArray(donationData.value.transactions) ? donationData.value.transactions as Record<string, unknown>[] : [];
+        setDonations(transactions.map((d) => ({ id: String(d.id), requirementId: "prototype", amount: Number(d.amount || 0), transactionId: String(d.id), simulated: true as const })));
+      }
+      setApiOnline(connected);
+    };
+    void load();
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    void prototypeApi.predict({ ...riskInputs, iotObservations: networkOnline ? riskInputs.iotObservations : Math.min(riskInputs.iotObservations, 11) })
+      .then((value) => { if (active) setRulePrediction(value); });
+    return () => { active = false; };
+  }, [riskInputs, networkOnline]);
 
   const navItems: {
     id: Page;
@@ -332,6 +408,11 @@ function App() {
   const runScenario = async () => {
     const next = await prototypeApi.advanceScenario(scenarioIndex, scenarios);
     setScenarioIndex(next);
+    try {
+      const state = await prototypeApi.getSimulation();
+      setScenarioOverrides({ rainfallValue: Number(state.rainfall), soil: Number(state.soil_moisture), water: `${state.water_level} m`, roads: Number(state.affected_roads) });
+      setApiOnline(true);
+    } catch { setScenarioOverrides({}); }
     setShelterRows((rows) => rows.map((s, i) => ({ ...s, occupants: Math.min(s.capacity, s.occupants + (next ? [30, 55, 20][i] : 0)) })));
     setNotifications((rows) => [{ id: `N-${Date.now()}`, kind: "Risk change", message: `Demonstration scenario advanced to ${scenarios[next].time} (${scenarios[next].risk}% risk).`, time: new Date().toLocaleTimeString(), read: false }, ...rows]);
     if (next > 0) setNetworkOnline(false);
@@ -339,18 +420,26 @@ function App() {
     logAction("Scenario advanced", `${scenarios[next].time}; risk ${scenarios[next].risk}%; affected ${scenarios[next].affected}; protected ${scenarios[next].evacuated}`);
   };
 
-  const sendSOS = () => {
+  const sendSOS = async () => {
     setSosSent(true);
     const id = `FL-${Date.now().toString().slice(-5)}`;
     const alert: SOSAlert = { id: `SOS-${id}`, ...sosForm, people: Number(sosForm.people), battery: Number(sosForm.battery), queued: !networkOnline, createdAt: new Date().toISOString() };
     setSosAlerts((rows) => [alert, ...rows]);
     setIncidentRows((rows) => [{ id, location: sosForm.location, people: Number(sosForm.people), condition: sosForm.condition, status: "NEW", medical: sosForm.medical }, ...rows]);
+    try {
+      const saved = await prototypeApi.sendSOS({ people_count: alert.people, location: alert.location, medical_emergency: alert.medical, battery: alert.battery, severity: alert.medical ? "CRITICAL" : "HIGH" });
+      setSosAlerts((rows) => [mapSos(saved), ...rows.slice(1)]);
+      setIncidentRows((await prototypeApi.getIncidents()).map(mapIncident));
+      setApiOnline(true);
+    } catch { /* keep the optimistic local prototype SOS and incident */ }
     setNotifications((rows) => [{ id: `N-${Date.now()}`, kind: "SOS", message: `SOS ${alert.id} created for ${sosForm.location}${alert.queued ? " and queued offline" : ""}.`, time: new Date().toLocaleTimeString(), read: false }, ...rows]);
     logAction("SOS created", `${alert.id}; ${sosForm.people} people; ${sosForm.location}; ${alert.queued ? "queued" : "forwarded in prototype"}`);
   };
 
-  const resetScenario = () => {
-    setScenarioIndex(0);
+  const resetScenario = async () => {
+    const resetIndex = await prototypeApi.resetScenario();
+    setScenarioIndex(resetIndex);
+    setScenarioOverrides({});
     setRouteChanged(false);
     setSosSent(false);
     setNetworkOnline(true);
@@ -383,9 +472,9 @@ function App() {
           </button>
         </div>
 
-        <div className="system-status">
+        <div className="system-status" aria-live="polite">
           <span className="status-dot" />
-          System Operational
+          {apiOnline ? "Prototype API connected" : "Demo fallback active"}
         </div>
 
         <div className="nav-section-title">OPERATIONS</div>
@@ -458,7 +547,11 @@ function App() {
               className={`network-toggle ${
                 networkOnline ? "online" : "offline"
               }`}
-              onClick={() => setNetworkOnline((v) => !v)}
+              onClick={async () => {
+                const nextOnline = !networkOnline;
+                if (!nextOnline) { try { await prototypeApi.simulateOffline(); setApiOnline(true); } catch { /* simulated local offline fallback */ } }
+                setNetworkOnline(nextOnline);
+              }}
             >
               {networkOnline ? <Wifi size={16} /> : <WifiOff size={16} />}
               {networkOnline ? "ONLINE" : "OFFLINE"}
@@ -505,8 +598,8 @@ function App() {
                 <StatCard
                   icon={<AlertTriangle size={21} />}
                   title="CRITICAL INCIDENTS"
-                  value="12"
-                  subtitle="4 require immediate response"
+                  value={Number(dashboardSummary?.critical_incidents ?? 12)}
+                  subtitle="Prototype API summary"
                   danger
                 />
                 <StatCard
@@ -530,13 +623,13 @@ function App() {
                 <StatCard
                   icon={<MessageSquareWarning size={21} />}
                   title="ACTIVE SOS"
-                  value={sosSent ? "8" : "7"}
+                  value={Number(dashboardSummary?.active_sos ?? (sosSent ? 8 : 7)) + sosAlerts.length}
                   subtitle="Emergency requests"
                 />
                 <StatCard
                   icon={<Radio size={21} />}
                   title="EMERGENCY NODES"
-                  value={networkOnline ? "18" : "11"}
+                  value={communicationNodes.length || (networkOnline ? 18 : 11)}
                   subtitle="Connected gateways"
                 />
               </section>
@@ -1005,9 +1098,9 @@ function App() {
               <div className="stats-grid">
                 <StatCard
                   icon={<Users size={21} />}
-                  title="AFFECTED POPULATION"
-                  value={scenario.affected.toLocaleString()}
-                  subtitle="Current simulation"
+                  title="AFFECTED HOUSEHOLDS"
+                  value={Number(impactSummary?.affected_households ?? Math.round(scenario.affected / 4)).toLocaleString()}
+                  subtitle="Backend prototype impact estimate"
                   danger={scenario.risk >= 80}
                 />
                 <StatCard
@@ -1513,8 +1606,8 @@ function App() {
                 <StatCard
                   icon={<Siren size={21} />}
                   title="ASSIGNMENTS"
-                  value="19"
-                  subtitle="Current assignments"
+                  value={rescueAssignments.length || 19}
+                  subtitle="Backend prototype assignments"
                 />
                 <StatCard
                   icon={<CheckCircle2 size={21} />}
@@ -1884,13 +1977,13 @@ function App() {
           )}
           {activePage === "prediction" && <div className="panel"><h3>Rule-based prototype estimate: {rulePrediction.score}% ? {rulePrediction.level}</h3><p className="prototype-note">Transparent deterministic calculation, not a trained production model. Confidence indicator: {rulePrediction.confidence}% (heuristic).</p><p>Contributing factors: {rulePrediction.factors.join(" ? ")}</p><div className="prediction-input-grid">{([ ["Rainfall (mm)", "rainfall", 0, 300], ["Forecast rainfall (mm)", "forecastRainfall", 0, 300], ["Soil moisture (%)", "soilMoisture", 0, 100], ["Elevation (m)", "elevation", 0, 5000], ["Slope (degrees)", "slope", 0, 90], ["Water level (prototype scale)", "waterLevel", 0, 100], ["Historical flood frequency", "historicalFrequency", 0, 100], ["IoT observation nodes", "iotObservations", 0, 50], ["Terrain vulnerability", "terrainVulnerability", 0, 100] ] as const).map(([label, key, min, max]) => <label key={key}>{label}<input type="number" min={min} max={max} value={riskInputs[key]} onChange={(e) => setRiskInputs((v) => ({ ...v, [key]: Math.max(min, Math.min(max, Number(e.target.value))) }))} /></label>)}</div><p>Scenario sequence remains fixed at 42% / 71% / 91% for comparability; the rule estimate responds to these inputs.</p></div>}
           {activePage === "impact" && <div className="panel"><div className="panel-header"><div><h3>Exposure by village</h3><span>Scenario data; illustrative, not live population data</span></div></div>{villages.map((v) => <div className="chart-row" key={v.name}><span>{v.name}</span><div className="progress"><div style={{ width: `${v.risk}%` }} /></div><b>{Math.round(v.population * scenario.risk / 100)} at risk</b></div>)}<p>Estimated households: {Math.round(scenario.affected / 4)} ? population at risk: {scenario.affected.toLocaleString()} ? roads: {scenario.roads} ? bridges: {scenario.roads ? 1 : 0} ? infrastructure: {scenario.isolated ? "1 village node isolated" : "monitoring"}</p><div className="network-state">{scenarios.map((item) => <span className="status-tag" key={item.time}>{item.time}: {item.affected} affected ? {item.evacuated} protected</span>)}</div></div>}
-          {activePage === "preventive" && <PageWrapper title="Preventive Evacuation" subtitle="Household records are synthetic demonstration data"><div className="panel"><div className="table-head"><span>Household / zone</span><span>People</span><span>Status</span><span>Action</span></div>{records.map((r) => <div className="table-row" key={r.id}><b>{r.household} ? {r.village}</b><span>{r.people}</span><span className="status-tag">{r.status}</span><button className="small-button" onClick={() => { setRecords((rows) => rows.map((x) => x.id === r.id ? { ...x, status: x.status === "Evacuated" ? "Pending" : "Evacuated" } : x)); logAction("Evacuation status updated", `${r.id} ? status changed`); }}>Update status</button><button className="small-button" onClick={() => { logAction("Responder dispatched", `Household ${r.id}, ${r.village}`); setNotifications((rows) => [{ id: `N-${Date.now()}`, kind: "Evacuation", message: `Responder dispatch simulated for ${r.id}.`, time: new Date().toLocaleTimeString(), read: false }, ...rows]); }}>Dispatch responder</button></div>)}</div></PageWrapper>}
-          {(activePage === "incidents" || activePage === "rescue") && <div className="panel"><div className="panel-header"><div><h3>{activePage === "rescue" ? "Assigned incidents & teams" : "Live prototype incident queue"}</h3><span>Assignments and status updates affect this session state</span></div></div>{incidentRows.map((incident) => <div className="data-row" key={incident.id}><span className="status-tag">{incident.status}</span><b>#{incident.id} ? {incident.location} ? {incident.people} people</b><small>{incident.condition} {incident.team ? `? ${incident.team}` : "? unassigned"}</small><select aria-label={`Assign team to ${incident.id}`} value={incident.team || ""} onChange={(e) => { setIncidentRows((rows) => rows.map((x) => x.id === incident.id ? { ...x, team: e.target.value || undefined, status: e.target.value ? "ASSIGNED" : "NEW" } : x)); logAction("Incident assigned", `${incident.id} ? ${e.target.value || "unassigned"}`); }}><option value="">Assign rescue team</option><option>Team Alpha</option><option>Team Bravo</option><option>Team Charlie</option><option>Team Delta</option></select><select aria-label={`Update incident status ${incident.id}`} value={incident.status} onChange={(e) => { setIncidentRows((rows) => rows.map((x) => x.id === incident.id ? { ...x, status: e.target.value as Incident["status"] } : x)); logAction("Incident status updated", `${incident.id} ? ${e.target.value}`); }}><option>NEW</option><option>ASSIGNED</option><option>EN ROUTE</option><option>RESCUED</option><option>CLOSED</option></select><button className="small-button" onClick={() => { setIncidentRows((rows) => rows.map((x) => x.id === incident.id ? { ...x, status: "EN ROUTE" } : x)); logAction("Rescue dispatched", `${incident.id} dispatched; route guidance is indicative`); }}>Dispatch</button></div>)}</div>}
-          {activePage === "shelters" && <div className="shelter-grid">{shelterRows.map((shelter) => <div className="panel" key={shelter.id}><h3>{shelter.name}</h3><p>Capacity {shelter.capacity} ? Occupancy {shelter.occupants} ? Space {shelter.capacity - shelter.occupants}</p><p>Water {shelter.water} ? Food {shelter.food} ? Medicine {shelter.medicine} ? Blankets {shelter.blankets} ? Accessible {shelter.accessible ? "Yes" : "Needs review"}</p><button className="small-button" onClick={() => { setShelterRows((rows) => rows.map((x) => x.id === shelter.id ? { ...x, occupants: Math.min(x.capacity, x.occupants + 10) } : x)); logAction("Shelter updated", `${shelter.name}; occupancy +10 in prototype`); }}>Update occupancy +10</button><button className="small-button" onClick={() => { setShelterRows((rows) => rows.map((x) => x.id === shelter.id ? { ...x, water: "Replenishment requested" } : x)); logAction("Shelter resources updated", `${shelter.name}; water replenishment requested`); }}>Request water</button></div>)}</div>}
-          {activePage === "relief" && <div className="panel"><h3>Simulated donation allocation</h3><p>Prototype only; no payment or real donation is processed.</p><button className="primary-button" onClick={() => { const id = `TXN-SIM-${Date.now().toString(36).toUpperCase()}`; setDonations((rows) => [{ id, requirementId: "REQ-RAMPUR-WATER", amount: 500, transactionId: id, simulated: true }, ...rows]); logAction("Simulated donation", `${id}; INR 500 allocated to demonstration water requirement`); setFormMessage(`Simulated transaction ${id}`); }}>Simulate ?500 donation</button>{formMessage && <p role="status">{formMessage}</p>}{donations.map((d) => <div className="data-row" key={d.id}><span className="status-tag">SIMULATED</span><b>?{d.amount} ? {d.transactionId}</b></div>)}</div>}
+          {activePage === "preventive" && <PageWrapper title="Preventive Evacuation" subtitle="Household records are synthetic demonstration data"><div className="panel"><div className="table-head"><span>Household / zone</span><span>People</span><span>Status</span><span>Action</span></div>{records.map((r) => <div className="table-row" key={r.id}><b>{r.household} ? {r.village}</b><span>{r.people}</span><span className="status-tag">{r.status}</span><button className="small-button" onClick={() => { void updateHousehold(r, r.status === "Evacuated" ? "Pending" : "Evacuated"); }}>Update status</button><button className="small-button" onClick={() => { void prototypeApi.updateHousehold(r.id, "Assistance Required").then(() => setApiOnline(true)).catch(() => undefined); logAction("Responder dispatched", `Household ${r.id}, ${r.village}`); setNotifications((rows) => [{ id: `N-${Date.now()}`, kind: "Evacuation", message: `Responder dispatch simulated for ${r.id}.`, time: new Date().toLocaleTimeString(), read: false }, ...rows]); }}>Dispatch responder</button></div>)}</div></PageWrapper>}
+          {(activePage === "incidents" || activePage === "rescue") && <div className="panel"><div className="panel-header"><div><h3>{activePage === "rescue" ? "Assigned incidents & teams" : "Live prototype incident queue"}</h3><span>Assignments and status updates affect this session state</span></div></div>{incidentRows.map((incident) => <div className="data-row" key={incident.id}><span className="status-tag">{incident.status}</span><b>#{incident.id} ? {incident.location} ? {incident.people} people</b><small>{incident.condition} {incident.team ? `? ${incident.team}` : "? unassigned"}</small><select aria-label={`Assign team to ${incident.id}`} value={incident.team || ""} onChange={(e) => { const team = e.target.value; setIncidentRows((rows) => rows.map((x) => x.id === incident.id ? { ...x, team: team || undefined, status: team ? "ASSIGNED" : "NEW" } : x)); if (team) void prototypeApi.assignIncident(incident.id, team).then((saved) => { setIncidentRows((rows) => rows.map((x) => x.id === incident.id ? mapIncident(saved) : x)); setApiOnline(true); }).catch(() => undefined); logAction("Incident assigned", `${incident.id}: ${team || "unassigned"}`); }}><option value="">Assign rescue team</option><option>Team Alpha</option><option>Team Bravo</option><option>Team Charlie</option><option>Team Delta</option></select><select aria-label={`Update incident status ${incident.id}`} value={incident.status} onChange={(e) => { const status = e.target.value as Incident["status"]; setIncidentRows((rows) => rows.map((x) => x.id === incident.id ? { ...x, status } : x)); void prototypeApi.updateIncident(incident.id, status).then((saved) => { setIncidentRows((rows) => rows.map((x) => x.id === incident.id ? mapIncident(saved) : x)); setApiOnline(true); }).catch(() => undefined); logAction("Incident status updated", `${incident.id}: ${status}`); }}><option>NEW</option><option>ASSIGNED</option><option>EN ROUTE</option><option>RESCUED</option><option>CLOSED</option></select><button className="small-button" onClick={() => { const team = incident.team || "Team Delta"; setIncidentRows((rows) => rows.map((x) => x.id === incident.id ? { ...x, team, status: "EN ROUTE" } : x)); void prototypeApi.dispatchRescue(team).then((result) => { setRescueAssignments((rows) => [result, ...rows]); setApiOnline(true); }).catch(() => undefined); logAction("Rescue dispatched", `${incident.id} dispatched; route guidance is indicative`); }}>Dispatch</button></div>)}</div>}
+          {activePage === "shelters" && <div className="shelter-grid">{shelterRows.map((shelter) => <div className="panel" key={shelter.id}><h3>{shelter.name}</h3><p>Capacity {shelter.capacity} ? Occupancy {shelter.occupants} ? Space {shelter.capacity - shelter.occupants}</p><p>Water {shelter.water} ? Food {shelter.food} ? Medicine {shelter.medicine} ? Blankets {shelter.blankets} ? Accessible {shelter.accessible ? "Yes" : "Needs review"}</p><button className="small-button" onClick={() => { void updateShelterOccupancy(shelter); }}>Update occupancy +10</button><button className="small-button" onClick={async () => { setShelterRows((rows) => rows.map((x) => x.id === shelter.id ? { ...x, water: "Replenishment requested" } : x)); try { const saved = await prototypeApi.updateShelter(shelter.id, { water_status: "replenishment requested" }); setShelterRows((rows) => rows.map((x) => x.id === shelter.id ? mapShelter(saved) : x)); setApiOnline(true); } catch { /* local fallback */ } logAction("Shelter resources updated", `${shelter.name}; water replenishment requested`); }}>Request water</button></div>)}</div>}
+          {activePage === "relief" && <div className="panel"><h3>Simulated donation allocation</h3><p>Prototype only; no payment or real donation is processed.</p><button className="primary-button" onClick={() => { void donateSimulated(); }}>Simulate ?500 donation</button>{reliefRequirements.map((need) => <div className="data-row" key={String(need.id)}><span className="status-tag">{String(need.priority || "verified")}</span><b>{String(need.item)} - {String(need.quantity)} at {String(need.location)}</b></div>)}{formMessage && <p role="status">{formMessage}</p>}{donations.map((d) => <div className="data-row" key={d.id}><span className="status-tag">SIMULATED</span><b>?{d.amount} ? {d.transactionId}</b></div>)}</div>}
           {activePage === "evacuation" && <div className="panel"><div className="panel-header"><div><h3>Route assessment</h3><span>Flood extent, blocked roads and shelter recommendation are scenario estimates.</span></div><button className="small-button" onClick={async () => { const result = await prototypeApi.recalculateRoute(scenario.roads); setRouteChanged(true); setRouteText(result.route); logAction("Route recalculated", `${result.route}; accessible ${result.accessible}; safety is not guaranteed`); }}>Recalculate route</button></div><p>{routeChanged ? routeText : "River road to Community Hall A"} ? {scenario.roads} blocked road(s) ? accessibility requires on-ground verification.</p></div>}
           {activePage === "simulation" && <PageWrapper title="System Simulation" subtitle="Deterministic prototype scenarios; no live agency or sensor feed"><div className="panel"><div className="panel-header"><div><h3>{scenario.time} ? {scenario.risk}% modeled risk</h3><span>Rain {scenario.rainfallValue} mm ? soil {scenario.soil}% ? water {scenario.water}</span></div><button className="primary-button" onClick={runScenario}>Run Next Scenario</button></div><div className="risk-evolution">{scenarios.map((s) => <div key={s.time} className={`evolution-card ${s.time === scenario.time ? "selected" : ""}`}><b>{s.time}</b><strong>{s.risk}%</strong><span>{s.rainfallValue} mm rain ? {s.soil}% soil</span></div>)}</div><p>Affected {scenario.affected} ? people protected {scenario.evacuated} ? blocked roads {scenario.roads} ? isolated villages {scenario.isolated}. Advancing updates prototype shelter, incident and network state too.</p><button className="small-button" onClick={resetScenario}>Reset demonstration</button></div></PageWrapper>}
-          {activePage === "communication" && <PageWrapper title="Communication Network" subtitle="Prototype connectivity across terrestrial radio and gateway nodes"><div className="panel"><div className="panel-header"><div><h3>Message pathway</h3><span>LoRa is terrestrial radio; no direct satellite messaging is represented.</span></div><button className="small-button" onClick={() => { setNetworkOnline((v) => !v); setNotifications((rows) => [{ id: `N-${Date.now()}`, kind: "Network failure", message: networkOnline ? "Prototype network failure simulated; messages may queue." : "Gateway available; queued messages can be forwarded.", time: new Date().toLocaleTimeString(), read: false }, ...rows]); logAction("Network state changed", networkOnline ? "NETWORK FAILURE ? SOS QUEUED" : "GATEWAY AVAILABLE ? MESSAGE FORWARDED"); }}>{networkOnline ? "Simulate network failure" : "Restore gateway"}</button></div><div className="network-state">{(networkOnline ? ["ONLINE", "GATEWAY AVAILABLE", "MESSAGE FORWARDED"] : ["NETWORK FAILURE", "OFFLINE", "SOS QUEUED"]).map((x) => <span className="status-tag" key={x}>{x}</span>)}</div><p className="prototype-note">All connectivity states shown are simulated and do not represent an emergency-service connection.</p></div><div className="stats-grid"><StatCard icon={<RadioTower />} title="CONNECTED NODES" value={networkOnline ? 3 : 1} subtitle="Prototype gateway state" /><StatCard icon={<WifiOff />} title="OFFLINE NODES" value={networkOnline ? 0 : 2} subtitle="Store and forward demonstration" /></div></PageWrapper>}
+          {activePage === "communication" && <PageWrapper title="Communication Network" subtitle="Prototype connectivity across terrestrial radio and gateway nodes"><div className="panel"><div className="panel-header"><div><h3>Message pathway</h3><span>LoRa is terrestrial radio; no direct satellite messaging is represented.</span></div><button className="small-button" onClick={() => { if (networkOnline) void prototypeApi.simulateOffline().then(() => setApiOnline(true)).catch(() => undefined); setNetworkOnline((v) => !v); setNotifications((rows) => [{ id: `N-${Date.now()}`, kind: "Network failure", message: networkOnline ? "Prototype network failure simulated; messages may queue." : "Gateway available; queued messages can be forwarded.", time: new Date().toLocaleTimeString(), read: false }, ...rows]); logAction("Network state changed", networkOnline ? "NETWORK FAILURE ? SOS QUEUED" : "GATEWAY AVAILABLE ? MESSAGE FORWARDED"); }}>{networkOnline ? "Simulate network failure" : "Restore gateway"}</button></div><div className="network-state">{(networkOnline ? ["ONLINE", "GATEWAY AVAILABLE", "MESSAGE FORWARDED"] : ["NETWORK FAILURE", "OFFLINE", "SOS QUEUED"]).map((x) => <span className="status-tag" key={x}>{x}</span>)}</div><p className="prototype-note">All connectivity states shown are simulated and do not represent an emergency-service connection.</p></div><div className="stats-grid"><StatCard icon={<RadioTower />} title="CONNECTED NODES" value={communicationNodes.filter((node) => String(node.status).toLowerCase() === "online").length || (networkOnline ? 3 : 1)} subtitle="Prototype gateway state" /><StatCard icon={<WifiOff />} title="OFFLINE NODES" value={communicationNodes.filter((node) => String(node.status).toLowerCase() !== "online").length || (networkOnline ? 0 : 2)} subtitle="Store and forward demonstration" /></div></PageWrapper>}
           {activePage === "notifications" && <PageWrapper title="Notifications" subtitle="Risk, roads, evacuation, SOS, shelters, relief and network events"><div className="panel"><div className="panel-header"><h3>Notification centre</h3><button className="small-button" onClick={() => setNotifications((rows) => rows.map((n) => ({ ...n, read: true })))}>Mark all read</button></div>{notifications.map((n) => <div className="data-row" key={n.id}><span className="status-tag">{n.kind}</span><b>{n.message}</b><small>{n.time} ? {n.read ? "Read" : "Unread"}</small></div>)}</div></PageWrapper>}
           {activePage === "layers" && <PageWrapper title="Map Layers" subtitle="Toggle overlays on the operational map"><div className="panel layer-grid">{Object.keys(layers).map((key) => <label className="layer-toggle" key={key}><input type="checkbox" checked={layers[key]} onChange={(e) => setLayers({ ...layers, [key]: e.target.checked })} />{key.replace(/^./, (c) => c.toUpperCase())}</label>)}</div><p className="prototype-note">Layer settings are available here; the base Leaflet map and scenario overlays remain active.</p></PageWrapper>}
           {activePage === "audit" && <PageWrapper title="Audit Logs" subtitle="Major prototype actions recorded locally for review"><div className="panel">{audit.length ? audit.map((a) => <div className="data-row" key={a.id}><span className="status-tag">{a.action}</span><b>{a.detail}</b><small>{a.time}</small></div>) : <p>No actions recorded yet. Simulation, SOS, dispatch and updates appear here.</p>}</div></PageWrapper>}
